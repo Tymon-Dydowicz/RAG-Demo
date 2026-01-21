@@ -1,23 +1,34 @@
 import os
 import numpy as np
 import faiss
+from qdrant_client import QdrantClient
+from qdrant_client.models import Distance, VectorParams, PointStruct, VectorStruct
 from sentence_transformers import SentenceTransformer
 from typing import List, Dict
 import json
 from datetime import datetime
 import requests
+from tqdm import tqdm
 
 
 class RAGSystem:
     def __init__(self, 
                  embedding_model_name='all-MiniLM-L6-v2',
                  llm_model='llama3.1',
-                 ollama_url='http://localhost:11434'):
+                 ollama_url='http://localhost:11434',
+                 qdrant_url='http://localhost:6333',
+                 collection_name='stackoverflow'
+                ):
         print(f"[{self._timestamp()}] Initializing RAG System...")
         
         print(f"[{self._timestamp()}] Loading embedding model: {embedding_model_name}")
         self.embedding_model = SentenceTransformer(embedding_model_name)
         self.embedding_dim = self.embedding_model.get_sentence_embedding_dimension()
+
+        print(f"[{self._timestamp()}] Connecting to Qdrant at {qdrant_url}")
+        self.client = QdrantClient(host="localhost", port=6333)
+        self.collection_name = collection_name
+        self._setup_collection()
         
         print(f"[{self._timestamp()}] Initializing FAISS vector store (dimension: {self.embedding_dim})")
         self.index = faiss.IndexFlatL2(self.embedding_dim)
@@ -35,6 +46,24 @@ class RAGSystem:
     
     def _timestamp(self):
         return datetime.now().strftime("%H:%M:%S")
+    
+    def _setup_collection(self):
+        collections = [c.name for c in self.client.get_collections().collections]
+        
+        if self.collection_name not in collections:
+            print(f"[{self._timestamp()}] Creating collection: {self.collection_name}")
+            self.client.create_collection(
+                collection_name=self.collection_name,
+                vectors_config=VectorParams(
+                    size=self.embedding_dim,
+                    distance=Distance.COSINE
+                )
+            )
+        else:
+            print(f"[{self._timestamp()}] Collection exists: {self.collection_name}")
+        
+        count = self.client.count(collection_name=self.collection_name).count
+        print(f"[{self._timestamp()}] Vectors in collection: {count}")
     
     def _check_ollama(self):
         try:
@@ -61,49 +90,75 @@ class RAGSystem:
         except Exception as e:
             print(f"[{self._timestamp()}] ⚠ WARNING: Error checking Ollama: {e}")
     
-    def add_documents(self, documents: List[str], metadata: List[Dict] = None):
-        print(f"[{self._timestamp()}] Adding {len(documents)} documents to vector store...")
-        
-        start_idx = len(self.documents)
-        self.documents.extend(documents)
-        if metadata is None:
-            metadata = [{"id": start_idx + i, "source": "unknown"} for i in range(len(documents))]
-        self.metadata.extend(metadata)
-        
+    def add_documents(self, documents: List[str], metadata: List[Dict], ids: List[int] = None, batch_size=100):
+        collections = [c.name for c in self.client.get_collections().collections]
+        if self.collection_name not in collections:
+            print(f"[{self._timestamp()}] Creating collection: {self.collection_name}")
+            self.client.create_collection(
+                collection_name=self.collection_name,
+                vectors_config=VectorParams(
+                    size=self.embedding_dim,
+                    distance=Distance.COSINE
+                )
+            )
+        else:
+            print(f"[{self._timestamp()}] Collection exists: {self.collection_name}")
+
+        count = self.client.count(collection_name=self.collection_name).count
+        print(f"[{self._timestamp()}] Vectors in collection before adding: {count}")
+
         print(f"[{self._timestamp()}] Generating embeddings...")
-        embeddings = self.embedding_model.encode(
-            documents,
-            show_progress_bar=True,
-            batch_size=32
-        )
-        embeddings = np.array(embeddings).astype('float32')
-        
-        self.index.add(embeddings)
-        
-        print(f"[{self._timestamp()}] Successfully added {len(documents)} documents")
-        print(f"[{self._timestamp()}] Total documents in system: {len(self.documents)}\n")
+        embeddings = []
+        for i in tqdm(range(0, len(documents), batch_size), desc="Embedding"):
+            batch = documents[i:i+batch_size]
+            batch_emb = self.embedding_model.encode(batch)
+            embeddings.extend(batch_emb)
+
+        points = []
+        for i, (doc, emb, meta) in enumerate(zip(documents, embeddings, metadata)):
+            point_id = ids[i] if ids is not None else i
+            points.append(PointStruct(
+                id=point_id,
+                vector=emb.tolist(),
+                payload={**meta, "text": doc}
+            ))
+
+        print(f"[{self._timestamp()}] Uploading to Qdrant...")
+        for i in tqdm(range(0, len(points), batch_size), desc="Upload"):
+            batch = points[i:i+batch_size]
+            self.client.upsert(collection_name=self.collection_name, points=batch)
+
+        count = self.client.count(collection_name=self.collection_name).count
+        print(f"[{self._timestamp()}] Total vectors after upload: {count}\n")
     
     def retrieve(self, query: str, top_k: int = 3) -> List[Dict]:
-        print(f"[{self._timestamp()}] Retrieving top {top_k} documents for query: '{query}'")
+        print(f"[{self._timestamp()}] Searching for: '{query}'")
+        rankCounter = 1
         
-        query_embedding = self.embedding_model.encode([query])
-        query_embedding = np.array(query_embedding).astype('float32')
+        query_emb = self.embedding_model.encode([query])[0]
         
-        distances, indices = self.index.search(query_embedding, top_k)
+        results = self.client.query_points(
+            collection_name=self.collection_name,
+            query=query_emb.tolist(),
+            limit=top_k,
+            
+        )
         
-        results = []
-        for i, (dist, idx) in enumerate(zip(distances[0], indices[0])):
-            if idx < len(self.documents):
-                results.append({
-                    "rank": i + 1,
-                    "document": self.documents[idx],
-                    "metadata": self.metadata[idx],
-                    "distance": float(dist),
-                    "similarity": 1 / (1 + float(dist))
+        retrieved = []
+        for i, hit in enumerate(results, 1):
+            _index, content = hit
+
+            for payload in [p.payload for p in content]:
+                retrieved.append({
+                    "rank": rankCounter,
+                    "score": payload.get('score', 0),
+                    "document": payload.get('text', 'No Text Found!'),
+                    "metadata": {k: v for k, v in payload.items() if k != 'text'},
                 })
+                rankCounter += 1
         
-        print(f"[{self._timestamp()}] Retrieved {len(results)} relevant documents\n")
-        return results
+        print(f"[{self._timestamp()}] Found {len(retrieved)} results\n")
+        return retrieved
     
     def generate_answer(self, query: str, context_docs: List[Dict]) -> str:
         print(f"[{self._timestamp()}] Generating answer using LOCAL LLM ({self.llm_model})...")
@@ -179,16 +234,15 @@ class RAGSystem:
         print("RESULTS")
         print("=" * 80)
         print(f"\n📝 QUESTION:\n{result['question']}\n")
-        print(f"💡 ANSWER:\n{result['answer']}\n")
         print(f"📚 RETRIEVED SOURCES ({len(result['retrieved_documents'])}):")
-        print("-" * 80)
-        
         for doc in result['retrieved_documents']:
-            print(f"\n[Rank {doc['rank']}] Similarity: {doc['similarity']:.4f}")
-            print(f"Source: {doc['metadata'].get('source', 'unknown')}")
-            preview = doc['document'][:200] + "..." if len(doc['document']) > 200 else doc['document']
+            print(f"\n[Rank {doc['rank']}] Score: {doc['score']}")
+            print(f"Tags: {doc['metadata'].get('tags', 'N/A')}")
+            print(f"Has Answers: {doc['metadata'].get('has_answers', 'false')}")
+            preview = doc['document'][:500] + "..." if len(doc['document']) > 500 else doc['document']
             print(f"Content: {preview}")
-        
+        print("-" * 80)
+        print(f"💡 ANSWER:\n{result['answer']}\n")
         print("\n" + "=" * 80 + "\n")
     
     def save_index(self, filepath: str = "rag_index.faiss"):
